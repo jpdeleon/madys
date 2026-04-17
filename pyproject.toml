@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "madys"
+version = "2.0.1"
+description = "MADYS: astronomical data analysis utilities."
+readme = "README.md"
+requires-python = ">=3.8"
+
+authors = [
+  { name = "MADYS developers" }
+]
+
+license = { text = "MIT" }
+
+dependencies = [
+  "numpy",
+  "scipy",
+  "pandas",
+  "matplotlib",
+  "astropy",
+  "astroquery",
+  "h5py",
+  "lxml",
+  "scikit-image",
+  # TAP client from GitHub (since code installs from git if missing)
+  "tap @ git+https://github.com/mfouesneau/tap"
+]
+
+[tool.setuptools]
+packages = ["madys"]
+
+[tool.setuptools.package-data]
+madys = [
+  "extinction/**/*",
+  "isochrones/**/*"
+]
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q"
+testpaths = [
+  "tests",
+]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
