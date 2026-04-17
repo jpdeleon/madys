@@ -14,6 +14,9 @@ run_mcmc : convenience wrapper that drives an ``emcee.EnsembleSampler``.
 mcmc_summary : posterior summary (median + 16th/84th percentiles).
 plot_corner : helper for a corner plot of the posterior samples.
 compare_models : fit the same star with two models and stack the corners.
+cluster_log_likelihood / cluster_log_probability / run_cluster_mcmc :
+    IMF-marginalized CMD fitter for a whole star cluster, sampling
+    (log10 age, distance modulus, E(B-V)).
 """
 
 import warnings
@@ -357,3 +360,289 @@ def mcmc_from_sample(sample_obj, index, model_version, **kwargs):
     phot_err[bad] = np.nan
 
     return run_mcmc(phot, phot_err, filters, model_version, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Cluster-CMD fitter
+# ---------------------------------------------------------------------------
+
+
+def _default_extinction_fn(ebv, filter_name):
+    """Default ``A_filter`` in magnitudes using MADYS' stored coefficients."""
+    return float(SampleObject.extinction(ebv, filter_name))
+
+
+def _isochrone_cmd(interpolator, log_age, ebv, color_filters, mag_filter,
+                   mass_grid=None, extinction_fn=None):
+    """Return (mass, color, mag) for the cluster isochrone at a given age."""
+    if extinction_fn is None:
+        extinction_fn = _default_extinction_fn
+    if mass_grid is None:
+        mass_grid = interpolator.masses
+
+    mass_grid = np.asarray(mass_grid, dtype=float)
+    log_mass = np.log10(mass_grid)
+    log_age_arr = np.full_like(log_mass, float(log_age))
+    abs_mags = interpolator.predict(log_age_arr, log_mass)  # (n_mass, n_filters)
+
+    filters = list(interpolator.filters)
+    c1, c2 = color_filters
+    f_mag = mag_filter
+    try:
+        c1_idx = filters.index(c1)
+        c2_idx = filters.index(c2)
+        m_idx = filters.index(f_mag)
+    except ValueError as exc:
+        raise ValueError(
+            f"interpolator does not cover {color_filters!r} / {mag_filter!r}; "
+            f"available filters: {filters}."
+        ) from exc
+
+    A_c1 = float(extinction_fn(ebv, c1))
+    A_c2 = float(extinction_fn(ebv, c2))
+    A_m = float(extinction_fn(ebv, f_mag))
+
+    color_iso = (abs_mags[:, c1_idx] - abs_mags[:, c2_idx]) + (A_c1 - A_c2)
+    mag_iso_abs = abs_mags[:, m_idx]  # before distance/reddening
+    return mass_grid, color_iso, mag_iso_abs, A_m
+
+
+def cluster_log_likelihood(theta, interpolator, color, mag, color_err, mag_err,
+                           color_filters, mag_filter,
+                           mass_grid=None, imf_alpha=2.35,
+                           extinction_fn=None):
+    """Gaussian likelihood marginalized over an IMF-weighted mass axis.
+
+    ``theta`` is ``(log10_age_Myr, distance_modulus, E(B-V))``. For each
+    observed star, the likelihood is the IMF-weighted integral of a 2D
+    Gaussian in CMD space evaluated along the reddened, distance-shifted
+    isochrone.
+    """
+    log_age, mu, ebv = (float(x) for x in theta)
+    if ebv < 0:
+        return -np.inf
+
+    mass_grid, color_iso, mag_iso_abs, A_m = _isochrone_cmd(
+        interpolator, log_age, ebv, color_filters, mag_filter,
+        mass_grid=mass_grid, extinction_fn=extinction_fn,
+    )
+    mag_iso = mag_iso_abs + mu + A_m
+
+    good = np.isfinite(color_iso) & np.isfinite(mag_iso)
+    if good.sum() < 2:
+        return -np.inf
+
+    color_iso = color_iso[good]
+    mag_iso = mag_iso[good]
+    masses = mass_grid[good]
+
+    dm = np.gradient(masses)
+    dm = np.clip(dm, 0, None)
+    w = masses ** (-float(imf_alpha)) * dm
+    w_sum = w.sum()
+    if w_sum <= 0 or not np.isfinite(w_sum):
+        return -np.inf
+    log_w = np.log(w / w_sum)
+
+    color = np.asarray(color, dtype=float)
+    mag = np.asarray(mag, dtype=float)
+    color_err = np.asarray(color_err, dtype=float)
+    mag_err = np.asarray(mag_err, dtype=float)
+
+    good_obs = (
+        np.isfinite(color) & np.isfinite(mag)
+        & np.isfinite(color_err) & np.isfinite(mag_err)
+        & (color_err > 0) & (mag_err > 0)
+    )
+    if not np.any(good_obs):
+        return -np.inf
+
+    color = color[good_obs]
+    mag = mag[good_obs]
+    color_err = color_err[good_obs]
+    mag_err = mag_err[good_obs]
+
+    dc = color[:, None] - color_iso[None, :]
+    dm2 = mag[:, None] - mag_iso[None, :]
+    chi2 = (dc / color_err[:, None]) ** 2 + (dm2 / mag_err[:, None]) ** 2
+    log_norm = -_LN2PI - np.log(color_err) - np.log(mag_err)
+    log_arg = log_norm[:, None] + log_w[None, :] - 0.5 * chi2
+
+    max_log = np.max(log_arg, axis=1)
+    bad = ~np.isfinite(max_log)
+    if np.any(bad):
+        return -np.inf
+    log_lik_per_star = max_log + np.log(np.sum(np.exp(log_arg - max_log[:, None]), axis=1))
+    total = float(np.sum(log_lik_per_star))
+    if not np.isfinite(total):
+        return -np.inf
+    return total
+
+
+def cluster_log_prior(theta, interpolator, mu_range, ebv_range,
+                      log_age_range=None):
+    log_age, mu, ebv = (float(x) for x in theta)
+    la_lo, la_hi = interpolator.log_age_bounds
+    if log_age_range is not None:
+        la_lo = max(la_lo, float(log_age_range[0]))
+        la_hi = min(la_hi, float(log_age_range[1]))
+    if not (la_lo <= log_age <= la_hi):
+        return -np.inf
+    if not (float(mu_range[0]) <= mu <= float(mu_range[1])):
+        return -np.inf
+    if not (float(ebv_range[0]) <= ebv <= float(ebv_range[1])):
+        return -np.inf
+    if ebv < 0:
+        return -np.inf
+    return 0.0
+
+
+def cluster_log_probability(theta, interpolator, color, mag, color_err, mag_err,
+                            color_filters, mag_filter,
+                            mu_range, ebv_range, log_age_range=None,
+                            mass_grid=None, imf_alpha=2.35,
+                            extinction_fn=None):
+    lp = cluster_log_prior(theta, interpolator, mu_range, ebv_range,
+                           log_age_range=log_age_range)
+    if not np.isfinite(lp):
+        return -np.inf
+    ll = cluster_log_likelihood(
+        theta, interpolator, color, mag, color_err, mag_err,
+        color_filters, mag_filter,
+        mass_grid=mass_grid, imf_alpha=imf_alpha,
+        extinction_fn=extinction_fn,
+    )
+    if not np.isfinite(ll):
+        return -np.inf
+    return lp + ll
+
+
+def run_cluster_mcmc(color, mag, color_err, mag_err,
+                     color_filters, mag_filter, model_version,
+                     mu_range, ebv_range=(0.0, 1.0),
+                     age_range=(1.0, 1e4), mass_range=(0.1, 10.0),
+                     n_walkers=32, n_steps=2000, burn_in=500,
+                     initial=None, initial_scatter=(0.1, 0.1, 0.02),
+                     seed=None, interpolator=None,
+                     imf_alpha=2.35, mass_grid=None,
+                     extinction_fn=None,
+                     progress=False,
+                     n_grid_steps=(200, 200), **grid_kwargs):
+    """Sample ``(log10 age, distance modulus, E(B-V))`` from a cluster CMD.
+
+    Parameters
+    ----------
+    color, mag : array-like, shape (n_stars,)
+        Observed cluster color and magnitude.
+    color_err, mag_err : array-like, shape (n_stars,)
+        Per-star 1-sigma errors in color and magnitude.
+    color_filters : 2-tuple of str
+        Filter names defining the color axis, e.g. ``('Gbp', 'Grp')``.
+    mag_filter : str
+        Filter name of the y-axis magnitude, e.g. ``'G'``.
+    model_version : str
+        Isochrone family: ``'mist'``, ``'parsec2'``, ...
+    mu_range : tuple of float
+        Uniform prior bounds on the distance modulus.
+    ebv_range : tuple of float
+        Uniform prior bounds on the colour excess.
+    age_range, mass_range : tuple of float
+        Grid bounds used both to construct the :class:`IsochroneGrid` and
+        to clip the log-age prior.
+    interpolator : IsochroneInterpolator or None
+        Optional pre-built interpolator covering ``color_filters`` and
+        ``mag_filter``.
+    imf_alpha : float
+        Power-law IMF exponent (Salpeter: 2.35).
+    **grid_kwargs :
+        Forwarded to :class:`IsochroneGrid` (``feh``, ``v_vcrit``, ...).
+
+    Returns
+    -------
+    dict with keys ``sampler``, ``samples``, ``interpolator``,
+    ``color_filters``, ``mag_filter``, ``model_version``,
+    ``log_age_range``, ``mu_range``, ``ebv_range``.
+    """
+    if emcee is None:
+        raise ImportError("emcee is required for run_cluster_mcmc; pip install emcee.")
+
+    color = np.asarray(color, dtype=float)
+    mag = np.asarray(mag, dtype=float)
+    color_err = np.asarray(color_err, dtype=float)
+    mag_err = np.asarray(mag_err, dtype=float)
+    if not (color.shape == mag.shape == color_err.shape == mag_err.shape):
+        raise ValueError("color, mag, color_err, mag_err must share shape (n_stars,).")
+    if color.ndim != 1:
+        raise ValueError("cluster CMD inputs must be 1D arrays.")
+
+    all_filters = [color_filters[0], color_filters[1], mag_filter]
+    if interpolator is None:
+        interpolator = _build_interpolator(
+            model_version, all_filters,
+            mass_range=mass_range, age_range=age_range,
+            n_steps=n_grid_steps, **grid_kwargs,
+        )
+
+    log_age_range = (float(np.log10(age_range[0])), float(np.log10(age_range[1])))
+    mu_range = (float(mu_range[0]), float(mu_range[1]))
+    ebv_range = (float(ebv_range[0]), float(ebv_range[1]))
+
+    if initial is None:
+        initial = np.array([
+            0.5 * (log_age_range[0] + log_age_range[1]),
+            0.5 * (mu_range[0] + mu_range[1]),
+            0.5 * (ebv_range[0] + ebv_range[1]),
+        ])
+    initial = np.asarray(initial, dtype=float)
+    if initial.shape != (3,):
+        raise ValueError("initial must have shape (3,) for (log_age, mu, ebv).")
+
+    scatter = np.broadcast_to(np.asarray(initial_scatter, dtype=float), (3,))
+    rng = np.random.default_rng(seed)
+    p0 = initial + scatter * rng.standard_normal((n_walkers, 3))
+    p0[:, 0] = np.clip(p0[:, 0], *log_age_range)
+    p0[:, 1] = np.clip(p0[:, 1], *mu_range)
+    p0[:, 2] = np.clip(p0[:, 2], *ebv_range)
+
+    sampler = emcee.EnsembleSampler(
+        n_walkers, 3, cluster_log_probability,
+        args=(interpolator, color, mag, color_err, mag_err,
+              color_filters, mag_filter,
+              mu_range, ebv_range),
+        kwargs=dict(log_age_range=log_age_range,
+                    mass_grid=mass_grid, imf_alpha=imf_alpha,
+                    extinction_fn=extinction_fn),
+    )
+    sampler.run_mcmc(p0, n_steps, progress=progress)
+    discard = min(burn_in, max(0, n_steps - 1))
+    samples = sampler.get_chain(discard=discard, flat=True)
+
+    return {
+        'sampler': sampler,
+        'samples': samples,
+        'interpolator': interpolator,
+        'color_filters': color_filters,
+        'mag_filter': mag_filter,
+        'model_version': model_version,
+        'log_age_range': log_age_range,
+        'mu_range': mu_range,
+        'ebv_range': ebv_range,
+    }
+
+
+def cluster_mcmc_summary(result):
+    """Posterior medians and +/- 68% intervals for the cluster parameters."""
+    samples = result['samples'] if isinstance(result, dict) else np.asarray(result)
+    labels = ('log10_age_Myr', 'distance_modulus', 'ebv')
+    out = {}
+    for i, label in enumerate(labels):
+        chain = samples[:, i]
+        q16, q50, q84 = np.percentile(chain, [16, 50, 84])
+        out[label] = {
+            'median': float(q50),
+            'lower_1sigma': float(q50 - q16),
+            'upper_1sigma': float(q84 - q50),
+        }
+    out['age_Myr_median'] = float(10 ** out['log10_age_Myr']['median'])
+    out['distance_pc_median'] = float(10 ** (1.0 + out['distance_modulus']['median'] / 5.0))
+    return out

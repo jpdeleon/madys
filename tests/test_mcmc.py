@@ -40,7 +40,14 @@ def _make_fake_grid_module():
             self.model_version_info = kwargs
 
     class SampleObject:
-        pass
+        @staticmethod
+        def extinction(ebv, col):
+            fixed = {'G': 2.5, 'Bp': 3.2, 'Rp': 1.9, 'Gbp': 3.2, 'Grp': 1.9,
+                     'J': 0.77, 'H': 0.41, 'K': 0.25}
+            if '-' in col:
+                a, b = col.split('-')
+                return (fixed.get(a, 1.0) - fixed.get(b, 1.0)) * ebv
+            return fixed.get(col, 1.0) * ebv
 
     mod = types.ModuleType('madys.madys')
     mod.IsochroneGrid = IsochroneGrid
@@ -211,4 +218,199 @@ class TestRunMcmc:
             mcmc_module.run_mcmc(
                 [10.0, 11.0], [0.05], ['G', 'Bp'], 'fake',
                 interpolator=interp, n_walkers=8, n_steps=10, burn_in=0,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Cluster CMD fitter tests
+# ---------------------------------------------------------------------------
+
+
+def _make_cluster_grid_class():
+    """Return a fake IsochroneGrid class with a mass-dependent CMD color."""
+
+    class ClusterFakeGrid:
+        def __init__(self, model_version, filters, **kwargs):
+            self.model_version = model_version
+            self.filters = np.asarray(list(filters))
+            mass_range = kwargs.get('mass_range', [0.1, 2.0])
+            age_range = kwargs.get('age_range', [10.0, 1000.0])
+            n_mass, n_age = kwargs.get('n_steps', [80, 80])
+            self.masses = np.geomspace(mass_range[0], mass_range[1], n_mass)
+            self.ages = np.geomspace(age_range[0], age_range[1], n_age)
+            lm = np.log10(self.masses)[:, None]
+            la = np.log10(self.ages)[None, :]
+            # Main-sequence brightness + a turnoff-like feature that
+            # breaks the distance-age degeneracy: for stars above the
+            # (age-dependent) turnoff mass, mag_0 gets much brighter.
+            log_turnoff = 0.6 - 0.3 * la  # log10(M_to/Msun)
+            turnoff = 2.5 * np.where(lm > log_turnoff, lm - log_turnoff, 0.0) ** 2
+            mags_base = 5.0 - 5.0 * lm + 0.3 * la - turnoff
+            n_f = len(self.filters)
+            offsets = 0.05 * np.arange(n_f)
+            slope_m = np.zeros(n_f)
+            if n_f >= 3:
+                slope_m[1] = -0.3  # filter 1 (Bp): brighter for massive stars
+                slope_m[2] = 0.3   # filter 2 (Rp): dimmer for massive stars
+            self.data = np.stack(
+                [mags_base + offsets[i] + slope_m[i] * lm for i in range(n_f)],
+                axis=-1,
+            )
+
+    return ClusterFakeGrid
+
+
+@pytest.fixture(scope='module')
+def cluster_mcmc_module(monkeypatch_module):
+    pkg = types.ModuleType('madys')
+    pkg.__path__ = []
+    sub = types.ModuleType('madys.madys')
+
+    ClusterFakeGrid = _make_cluster_grid_class()
+
+    class SampleObject:
+        @staticmethod
+        def extinction(ebv, col):
+            fixed = {'G': 2.5, 'Bp': 3.2, 'Rp': 1.9}
+            return fixed.get(col, 1.0) * ebv
+
+    for m in (pkg, sub):
+        m.IsochroneGrid = ClusterFakeGrid
+        m.SampleObject = SampleObject
+
+    monkeypatch_module.setitem(sys.modules, 'madys', pkg)
+    monkeypatch_module.setitem(sys.modules, 'madys.madys', sub)
+    if 'madys.mcmc' in sys.modules:
+        del sys.modules['madys.mcmc']
+
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        'madys.mcmc',
+        os.path.join(madys_root, 'madys', 'mcmc.py'),
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    sys.modules['madys.mcmc'] = module
+    return module
+
+
+@pytest.fixture
+def cluster_interp(cluster_mcmc_module):
+    pkg = sys.modules['madys']
+    grid = pkg.IsochroneGrid('fake', ['G', 'Bp', 'Rp'],
+                             mass_range=[0.3, 2.5],
+                             age_range=[10.0, 1000.0],
+                             n_steps=[150, 150])
+    return cluster_mcmc_module.IsochroneInterpolator(grid)
+
+
+def _inject_fake_cluster(interp, extinction_fn, true_log_age=2.0, true_mu=5.5,
+                         true_ebv=0.04, n_stars=200, seed=1):
+    rng = np.random.default_rng(seed)
+    masses = rng.uniform(0.35, 2.4, size=n_stars)
+    abs_mags = interp.predict(np.full(n_stars, true_log_age), np.log10(masses))
+    A_G = extinction_fn(true_ebv, 'G')
+    A_Bp = extinction_fn(true_ebv, 'Bp')
+    A_Rp = extinction_fn(true_ebv, 'Rp')
+    color = (abs_mags[:, 1] - abs_mags[:, 2]) + (A_Bp - A_Rp)
+    mag = abs_mags[:, 0] + true_mu + A_G
+    color_err = 0.02 * np.ones(n_stars)
+    mag_err = 0.03 * np.ones(n_stars)
+    color += color_err * rng.standard_normal(n_stars)
+    mag += mag_err * rng.standard_normal(n_stars)
+    return color, mag, color_err, mag_err
+
+
+class TestClusterLogLikelihood:
+    def test_peaks_at_truth(self, cluster_mcmc_module, cluster_interp):
+        pkg = sys.modules['madys']
+        ext_fn = pkg.SampleObject.extinction
+        true = (np.log10(100.0), 5.5, 0.04)
+        color, mag, color_err, mag_err = _inject_fake_cluster(
+            cluster_interp, ext_fn, true_log_age=true[0], true_mu=true[1],
+            true_ebv=true[2], n_stars=200, seed=3,
+        )
+        ll_true = cluster_mcmc_module.cluster_log_likelihood(
+            true, cluster_interp, color, mag, color_err, mag_err,
+            color_filters=('Bp', 'Rp'), mag_filter='G',
+            extinction_fn=ext_fn,
+        )
+        ll_off = cluster_mcmc_module.cluster_log_likelihood(
+            (true[0] + 0.3, true[1] + 0.4, true[2] + 0.1),
+            cluster_interp, color, mag, color_err, mag_err,
+            color_filters=('Bp', 'Rp'), mag_filter='G',
+            extinction_fn=ext_fn,
+        )
+        assert np.isfinite(ll_true)
+        assert ll_true > ll_off
+
+    def test_negative_ebv_is_invalid(self, cluster_mcmc_module, cluster_interp):
+        pkg = sys.modules['madys']
+        ext_fn = pkg.SampleObject.extinction
+        color, mag, color_err, mag_err = _inject_fake_cluster(
+            cluster_interp, ext_fn, n_stars=20, seed=1,
+        )
+        assert cluster_mcmc_module.cluster_log_likelihood(
+            (2.0, 5.5, -0.01), cluster_interp, color, mag, color_err, mag_err,
+            color_filters=('Bp', 'Rp'), mag_filter='G',
+            extinction_fn=ext_fn,
+        ) == -np.inf
+
+    def test_prior_honors_ranges(self, cluster_mcmc_module, cluster_interp):
+        assert cluster_mcmc_module.cluster_log_prior(
+            (2.0, 5.5, 0.04), cluster_interp,
+            mu_range=(5.0, 6.0), ebv_range=(0.0, 0.2),
+        ) == 0.0
+        assert cluster_mcmc_module.cluster_log_prior(
+            (2.0, 10.0, 0.04), cluster_interp,
+            mu_range=(5.0, 6.0), ebv_range=(0.0, 0.2),
+        ) == -np.inf
+
+
+class TestRunClusterMcmc:
+    def test_recovers_injected_cluster(self, cluster_mcmc_module, cluster_interp):
+        pkg = sys.modules['madys']
+        ext_fn = pkg.SampleObject.extinction
+        true_log_age, true_mu, true_ebv = np.log10(100.0), 5.5, 0.05
+
+        color, mag, color_err, mag_err = _inject_fake_cluster(
+            cluster_interp, ext_fn,
+            true_log_age=true_log_age, true_mu=true_mu, true_ebv=true_ebv,
+            n_stars=200, seed=2,
+        )
+
+        result = cluster_mcmc_module.run_cluster_mcmc(
+            color, mag, color_err, mag_err,
+            color_filters=('Bp', 'Rp'), mag_filter='G',
+            model_version='fake',
+            mu_range=(3.0, 8.0), ebv_range=(0.0, 0.3),
+            age_range=(10.0, 1000.0), mass_range=(0.3, 2.5),
+            n_walkers=24, n_steps=400, burn_in=150,
+            interpolator=cluster_interp, seed=5,
+            extinction_fn=ext_fn,
+        )
+
+        samples = result['samples']
+        assert samples.ndim == 2 and samples.shape[1] == 3
+
+        med_la, med_mu, med_ebv = np.median(samples, axis=0)
+        assert abs(med_la - true_log_age) < 0.3
+        assert abs(med_mu - true_mu) < 0.4
+        assert abs(med_ebv - true_ebv) < 0.08
+
+        summary = cluster_mcmc_module.cluster_mcmc_summary(result)
+        assert 'age_Myr_median' in summary
+        assert summary['distance_pc_median'] == pytest.approx(
+            10 ** (1.0 + summary['distance_modulus']['median'] / 5.0)
+        )
+
+    def test_shape_mismatch_raises(self, cluster_mcmc_module, cluster_interp):
+        with pytest.raises(ValueError):
+            cluster_mcmc_module.run_cluster_mcmc(
+                [0.1, 0.2], [10.0], [0.02, 0.02], [0.03, 0.03],
+                color_filters=('Bp', 'Rp'), mag_filter='G',
+                model_version='fake',
+                mu_range=(5.0, 6.0), ebv_range=(0.0, 0.1),
+                interpolator=cluster_interp,
+                n_walkers=8, n_steps=10, burn_in=0,
             )
