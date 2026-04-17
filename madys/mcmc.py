@@ -472,8 +472,8 @@ def cluster_log_likelihood(theta, interpolator, color, mag, color_err, mag_err,
     bad = ~np.isfinite(max_log)
     if np.any(bad):
         return -np.inf
-    log_lik_per_star = max_log + np.log(np.sum(np.exp(log_arg - max_log[:, None]), axis=1))
-    total = float(np.sum(log_lik_per_star))
+    log_like_per_star = max_log + np.log(np.sum(np.exp(log_arg - max_log[:, None]), axis=1))
+    total = float(np.sum(log_like_per_star))
     if not np.isfinite(total):
         return -np.inf
     return total
