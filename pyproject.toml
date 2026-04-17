@@ -29,6 +29,12 @@ dependencies = [
   "tap @ git+https://github.com/mfouesneau/tap"
 ]
 
+[project.optional-dependencies]
+mcmc = [
+  "emcee>=3.0",
+  "corner>=2.2",
+]
+
 [tool.setuptools]
 packages = ["madys"]
 
